@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
+import { Readable } from 'stream';
 import {
   createReadStream, existsSync, mkdirSync, unlinkSync,
   statSync, readdirSync, mkdtempSync, rmSync
@@ -696,7 +697,7 @@ async function transcodeForIOS(filePath, jobDir, title, sourceMetadata) {
     && sourceMetadata?.pixelFormat === 'yuv420p'
     && !hdr;
   const args = [
-    '-y', '-threads', '0', '-i', filePath, '-map', '0:v:0', '-map', '0:a:0?',
+    '-y', '-threads', '1', '-i', filePath, '-map', '0:v:0', '-map', '0:a:0?',
   ];
   if (videoCopySafe) {
     // Already H.264/yuv420p — just remux, no encode needed (fastest path)
@@ -710,7 +711,7 @@ async function transcodeForIOS(filePath, jobDir, title, sourceMetadata) {
       );
     }
     // ultrafast preset = ~5-8x faster than medium; crf 18 = near-lossless quality (same as original)
-    args.push('-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18', '-pix_fmt', 'yuv420p', '-threads', '0');
+    args.push('-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18', '-pix_fmt', 'yuv420p', '-threads', '1');
   }
   // Check if audio already AAC — if so, copy it too (no re-encode at all in best case)
   const audioAlreadyAac = sourceMetadata?.audioCodec === 'aac';
@@ -1120,6 +1121,30 @@ app.post('/api/download', async (req, res) => {
       res.setHeader('Content-Disposition', `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeFilenameHeader(filename)}`);
       res.setHeader('Content-Length', stat.size);
       return createReadStream(filePath).pipe(res).on('close', () => rmSync(jobDir, { recursive: true, force: true }));
+    }
+
+    // Fast path: If the media format has a direct stream URL (e.g. Instagram progressive MP4),
+    // stream it directly chunk-by-chunk to the user with zero disk usage and zero FFmpeg overhead!
+    try {
+      const [primary] = await ytDlpJsonLines(['--dump-json', '--no-playlist', '--no-warnings', '--user-agent', UA, url]);
+      const direct = primary.url || (primary.formats || []).slice().reverse().find(f => f.url && f.vcodec !== 'none' && f.acodec !== 'none')?.url;
+      if (direct && !isAudio) {
+        console.log(`[DIRECT STREAM] Proxying CDN stream for ${primary.title || 'media'}`);
+        const cdnRes = await fetch(direct, { headers: { 'User-Agent': UA } });
+        if (cdnRes.ok) {
+          const filename = makeVideoFilename(primary, url);
+          const asciiFallback = filename.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
+          res.setHeader('Content-Type', 'video/mp4');
+          res.setHeader('Content-Disposition', `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeFilenameHeader(filename)}`);
+          const len = cdnRes.headers.get('content-length');
+          if (len) res.setHeader('Content-Length', len);
+          res.setHeader('X-Filename', encodeFilenameHeader(filename));
+          res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length, X-Filename');
+          return Readable.fromWeb(cdnRes.body).pipe(res);
+        }
+      }
+    } catch (directErr) {
+      console.warn('[DIRECT STREAM FALLBACK]', directErr.message);
     }
 
     const mode = ['source', 'ios-compatible'].includes(outputMode) ? outputMode : defaultOutputMode(req);
