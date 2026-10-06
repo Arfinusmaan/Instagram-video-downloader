@@ -291,7 +291,7 @@ function triggerBlobDownload(blob, filename, mimeType = 'video/mp4') {
 
 async function apiHealth() {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
+  const timeout = setTimeout(() => controller.abort(), 25000);
   try {
     const res  = await fetch(`${API}/api/health`, { signal: controller.signal, cache: 'no-store' });
     if (!res.ok) throw new Error(`Health check failed (${res.status})`);

@@ -21,6 +21,10 @@ const PORT = Number(process.env.PORT) || 3001;
 const bundledYtDlpPath = join(__dirname, '.tools', 'yt-dlp.exe');
 const YT_DLP = process.env.YT_DLP_PATH || (existsSync(bundledYtDlpPath) ? bundledYtDlpPath : 'yt-dlp');
 const FFPROBE = process.env.FFPROBE_PATH || ffprobeStatic.path;
+const secretCookiesPath = '/etc/secrets/cookies.txt';
+const localCookiesPath  = join(__dirname, 'cookies.txt');
+const COOKIES_PATH = process.env.COOKIES_PATH || (existsSync(secretCookiesPath) ? secretCookiesPath : (existsSync(localCookiesPath) ? localCookiesPath : null));
+if (COOKIES_PATH) console.log(`[INIT] Instagram cookies loaded from: ${COOKIES_PATH}`);
 const DOWNLOAD_JOBS = new Map();
 const JOB_TTL_MS = 30 * 60 * 1000;
 const VALID_QUALITY_IDS = new Set(['4k', '2k', '1080p', '720p', '480p', '360p']);
@@ -759,6 +763,10 @@ function ytDlpJsonLines(args) {
     if (ffmpegPath && existsSync(ffmpegPath)) {
       finalArgs.unshift('--ffmpeg-location', ffmpegPath);
     }
+    if (COOKIES_PATH && existsSync(COOKIES_PATH)) {
+      finalArgs.unshift('--cookies', COOKIES_PATH);
+    }
+    finalArgs.unshift('--extractor-args', 'youtube:player_client=android,web');
     const proc = spawn(YT_DLP, finalArgs, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     let stdout = '';
     let stderr = '';
@@ -793,6 +801,10 @@ function ytDlpDownload(args, prefix, isAudio = false, directory = TEMP_DIR, onPr
     if (ffmpegPath && existsSync(ffmpegPath)) {
       finalArgs.unshift('--ffmpeg-location', ffmpegPath);
     }
+    if (COOKIES_PATH && existsSync(COOKIES_PATH)) {
+      finalArgs.unshift('--cookies', COOKIES_PATH);
+    }
+    finalArgs.unshift('--extractor-args', 'youtube:player_client=android,web');
 
     const proc = spawn(YT_DLP, finalArgs, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     let stderr = '';
@@ -1246,6 +1258,8 @@ app.get('/api/health', (_req, res) => {
       ffmpegPath: ffmpegPath || null,
       ffprobe: Boolean(FFPROBE && existsSync(FFPROBE)),
       ffprobePath: FFPROBE,
+      cookies: Boolean(COOKIES_PATH && existsSync(COOKIES_PATH)),
+      cookiesPath: COOKIES_PATH || null,
     });
   });
   proc.on('error', error => {
@@ -1261,6 +1275,8 @@ app.get('/api/health', (_req, res) => {
       ffmpegPath: ffmpegPath || null,
       ffprobe: Boolean(FFPROBE && existsSync(FFPROBE)),
       ffprobePath: FFPROBE,
+      cookies: Boolean(COOKIES_PATH && existsSync(COOKIES_PATH)),
+      cookiesPath: COOKIES_PATH || null,
     });
   });
 });
