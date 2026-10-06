@@ -767,7 +767,7 @@ function ytDlpJsonLines(args) {
     if (COOKIES_PATH && existsSync(COOKIES_PATH)) {
       finalArgs.unshift('--cookies', COOKIES_PATH);
     }
-    finalArgs.unshift('--extractor-args', 'youtube:player_client=android,web');
+    finalArgs.unshift('--extractor-args', 'youtube:player_client=tv_embedded,android');
     const proc = spawn(YT_DLP, finalArgs, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     let stdout = '';
     let stderr = '';
@@ -805,7 +805,7 @@ function ytDlpDownload(args, prefix, isAudio = false, directory = TEMP_DIR, onPr
     if (COOKIES_PATH && existsSync(COOKIES_PATH)) {
       finalArgs.unshift('--cookies', COOKIES_PATH);
     }
-    finalArgs.unshift('--extractor-args', 'youtube:player_client=android,web');
+    finalArgs.unshift('--extractor-args', 'youtube:player_client=tv_embedded,android');
 
     const proc = spawn(YT_DLP, finalArgs, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     let stderr = '';
