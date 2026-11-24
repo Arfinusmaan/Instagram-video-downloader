@@ -50,6 +50,28 @@ async function apiDownload({ url, qualityId, outputMode, onProgress }) {
 
   const jobUrl = `${base}/api/download/jobs/${encodeURIComponent(started.jobId)}`;
   const fileUrl = `${jobUrl}/file`;
+  const buildReadyResult = (jobData) => {
+    const output = jobData.metadata?.output || {};
+    return {
+      fileUrl,
+      filename: jobData.filename || 'video.mp4',
+      size: Number(output.size || 0),
+      directStream: Boolean(jobData.directStream),
+      verified: {
+        resolution: output.width && output.height ? `${output.width}x${output.height}` : null,
+        fps: output.fps ? `${output.fps} FPS` : null,
+        vcodec: output.videoCodec || null,
+        acodec: output.audioCodec || null,
+        size: Number(output.size || 0),
+      },
+    };
+  };
+
+  if (started.status === 'ready') {
+    onProgress?.(100, 'Starting download…');
+    return buildReadyResult(started);
+  }
+
   const deadline = Date.now() + 20 * 60 * 1000;
   while (Date.now() < deadline) {
     const response = await fetch(jobUrl, { cache: 'no-store' });
@@ -58,19 +80,7 @@ async function apiDownload({ url, qualityId, outputMode, onProgress }) {
     onProgress?.(job.progress || 1, job.message || 'Preparing your video…');
     if (job.status === 'failed') throw new Error(job.error || 'Video preparation failed.');
     if (job.status === 'ready') {
-      const output = job.metadata?.output || {};
-      return {
-        fileUrl,
-        filename: job.filename || 'video.mp4',
-        size: Number(output.size || 0),
-        verified: {
-          resolution: output.width && output.height ? `${output.width}x${output.height}` : null,
-          fps: output.fps ? `${output.fps} FPS` : null,
-          vcodec: output.videoCodec || null,
-          acodec: output.audioCodec || null,
-          size: Number(output.size || 0),
-        },
-      };
+      return buildReadyResult(job);
     }
     await new Promise(resolve => setTimeout(resolve, 1000));
   }
@@ -576,17 +586,21 @@ export default function App() {
 
   // Quality selection
   const [quality, setQuality]       = useState(null);
-  // Keep one visible download action; choose the best delivery mode for this device automatically.
-  const [outputMode] = useState(() => detectIOSDevice() ? 'ios-compatible' : 'source');
+  // Device default is iPhone-compatible on iOS and source on Android/desktop;
+  // users can explicitly override that behavior.
+  const [outputModePreference, setOutputModePreference] = useState('auto');
+  const outputMode = outputModePreference === 'auto'
+    ? (detectIOSDevice() ? 'ios-compatible' : 'source')
+    : outputModePreference;
   // Prepare and verify the file before handing it to the browser's native downloader.
   const [dlState, setDlState] = useState('idle');
   const [dlPct, setDlPct] = useState(0);
   const [dlElapsed, setDlElapsed] = useState(0);
   const [dlLabel, setDlLabel] = useState('');
   const [dlError, setDlError] = useState('');
-  const [mobileJob, setMobileJob] = useState(null);
+  const [readyDownloadUrl, setReadyDownloadUrl] = useState(null);
 
-  // Audio download state (video uses a direct <a href> link now)
+  // Audio download state (video uses the verified job attachment URL)
   const [audioDlState, setAudioDlState] = useState('idle'); // idle|downloading|done|error
   const [audioDlLabel, setAudioDlLabel] = useState('');
   const [audioDlError, setAudioDlError] = useState('');
@@ -659,7 +673,7 @@ export default function App() {
     setMedia(null);
     setDlState('idle');
     setDlError('');
-    setMobileJob(null);
+    setReadyDownloadUrl(null);
 
     try {
       const meta = await apiFetchInfo(target);
@@ -697,7 +711,7 @@ export default function App() {
     setDlElapsed(0);
     setDlLabel('Preparing your video…');
     setDlError('');
-    setMobileJob(null);
+    setReadyDownloadUrl(null);
 
     try {
       const audioOnly = q.id === 'audio-320';
@@ -715,7 +729,7 @@ export default function App() {
         : await apiDownload({ ...downloadOptions, outputMode });
 
       setDlState(audioOnly ? 'done' : 'ready');
-      setDlLabel(audioOnly ? 'Audio download complete.' : 'Video is ready to download.');
+      setDlLabel(audioOnly ? 'Audio download complete.' : 'Ready — starting browser download…');
 
       // Save to history with verified specs
       const finalRes = result.verified?.resolution || q.resolution;
@@ -733,13 +747,20 @@ export default function App() {
         codec:      finalCodec,
         size:       fmtBytes(result.size),
         ts:         Date.now(),
-        downloadStarted: false,
-        readyForDownload: !audioOnly,
+        downloadStarted: !audioOnly,
+        readyForDownload: false,
       };
       setHistory(prev => [entry, ...prev]);
-      if (!audioOnly) setMobileJob({ ...result, historyId: entry.id });
       const specText = finalRes !== 'Audio Only' ? ` (${finalRes} · ${fmtBytes(result.size)})` : ` (${fmtBytes(result.size)})`;
-      showToast(audioOnly ? `Saved: ${result.filename}${specText}` : `Ready! Tap the download button.${specText}`);
+      if (audioOnly) {
+        showToast(`Saved: ${result.filename}${specText}`);
+      } else {
+        setReadyDownloadUrl(result.fileUrl);
+        showToast(`Starting browser download${specText}`);
+        // This is a real attachment URL. Let the browser own the download UI;
+        // never fetch the video into a JavaScript Blob.
+        window.location.href = result.fileUrl;
+      }
     } catch (err) {
       setDlState('error');
       setDlError(err.message);
@@ -1114,7 +1135,7 @@ export default function App() {
                   <QualitySelector
                     qualities={media.qualities}
                     selected={quality}
-                    onSelect={nextQuality => { setQuality(nextQuality); setMobileJob(null); setDlState('idle'); setDlPct(0); setDlError(''); }}
+                    onSelect={nextQuality => { setQuality(nextQuality); setReadyDownloadUrl(null); setDlState('idle'); setDlPct(0); setDlError(''); }}
                   />
                 </div>
 
@@ -1140,6 +1161,21 @@ export default function App() {
 
                 {/* ── Download Buttons ── */}
                 <div className="dl-actions">
+                  {!media.isCarousel && (
+                    <label className="output-mode-control">
+                      <span>Playback format</span>
+                      <select
+                        aria-label="Video playback format"
+                        value={outputModePreference}
+                        disabled={dlState === 'downloading'}
+                        onChange={event => setOutputModePreference(event.target.value)}
+                      >
+                        <option value="auto">Use device default ({detectIOSDevice() ? 'iPhone compatible' : 'original source'})</option>
+                        <option value="source">Original source quality</option>
+                        <option value="ios-compatible">iPhone compatible</option>
+                      </select>
+                    </label>
+                  )}
                   {/* Carousel batch download */}
                   {media.isCarousel ? (
                     <>
@@ -1175,19 +1211,9 @@ export default function App() {
                         <button id="download-video-btn" className="dl-primary" disabled>
                           <Loader2 size={19} className="spin"/> Preparing video for download…
                         </button>
-                      ) : dlState === 'ready' && mobileJob?.fileUrl ? (
-                        <a
-                          id="download-video-btn"
-                          className="dl-primary"
-                          href={mobileJob.fileUrl}
-                          onClick={() => {
-                            setHistory(prev => prev.map(item => item.id === mobileJob.historyId
-                              ? { ...item, downloadStarted: true, readyForDownload: false }
-                              : item));
-                            showToast('Browser download started. Check your Downloads.');
-                          }}
-                        >
-                          <Download size={19}/> Download {quality?.label || 'video'}
+                      ) : dlState === 'ready' ? (
+                        <a id="download-video-btn" className="dl-primary" href={readyDownloadUrl}>
+                          <Download size={19}/> Download again
                         </a>
                       ) : (
                         <button
@@ -1196,7 +1222,7 @@ export default function App() {
                           disabled={!quality}
                           onClick={() => handleDownload()}
                         >
-                          <Download size={19}/> Prepare {quality?.label || 'video'}
+                          <Download size={19}/> Download {quality?.label || 'video'}
                         </button>
                       )}
                     </>

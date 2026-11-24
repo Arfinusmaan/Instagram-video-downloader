@@ -5,12 +5,12 @@ import { randomUUID } from 'crypto';
 import { Readable } from 'stream';
 import {
   createReadStream, existsSync, mkdirSync, unlinkSync,
-  statSync, readdirSync, mkdtempSync, rmSync
+  statSync, readdirSync, mkdtempSync, rmSync, writeFileSync
 } from 'fs';
 import { join, extname } from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
-import { tmpdir } from 'os';
+import { tmpdir, totalmem } from 'os';
 import ffmpegPath from 'ffmpeg-static';
 import ffprobeStatic from 'ffprobe-static';
 
@@ -22,19 +22,42 @@ const PORT = Number(process.env.PORT) || 3001;
 const bundledYtDlpPath = join(__dirname, '.tools', 'yt-dlp.exe');
 const YT_DLP = process.env.YT_DLP_PATH || (existsSync(bundledYtDlpPath) ? bundledYtDlpPath : 'yt-dlp');
 const FFPROBE = process.env.FFPROBE_PATH || ffprobeStatic.path;
-const secretCookiesPath = '/etc/secrets/cookies.txt';
-const localCookiesPath  = join(__dirname, 'cookies.txt');
-const COOKIES_PATH = process.env.COOKIES_PATH || (existsSync(secretCookiesPath) ? secretCookiesPath : (existsSync(localCookiesPath) ? localCookiesPath : null));
-if (COOKIES_PATH) console.log(`[INIT] Instagram cookies loaded from: ${COOKIES_PATH}`);
 const DOWNLOAD_JOBS = new Map();
 const JOB_TTL_MS = 30 * 60 * 1000;
+const INFO_CACHE = new Map();
+const INFO_CACHE_TTL_MS = 10 * 60 * 1000;
+const INFO_CACHE_MAX = 50;
+const LOW_MEMORY_HOST = totalmem() <= 1024 * 1024 * 1024;
+// FFmpeg can use substantial memory when encoding 2K/4K frames. Keep concurrency
+// bounded per backend process unless the host is explicitly sized for more.
+const MAX_ACTIVE_VIDEO_PREPARATIONS = Math.max(1, Number(process.env.MAX_ACTIVE_VIDEO_PREPARATIONS) || (LOW_MEMORY_HOST ? 1 : 2));
+let activeVideoPreparations = 0;
 const VALID_QUALITY_IDS = new Set(['4k', '2k', '1080p', '720p', '480p', '360p']);
 
 // Temp folder for yt-dlp downloads
-const TEMP_DIR = join(tmpdir(), 'omnistream_4k');
+const TEMP_DIR = process.env.DOWNLOAD_TEMP_DIR || join(tmpdir(), 'omnistream_4k');
 if (!existsSync(TEMP_DIR)) mkdirSync(TEMP_DIR, { recursive: true });
 
-app.use(cors({ origin: '*' }));
+const envCookiesContent = process.env.COOKIES_TXT || process.env.COOKIES_CONTENT || '';
+const envCookiesPath = join(TEMP_DIR, 'env_cookies.txt');
+if (envCookiesContent.trim()) {
+  writeFileSync(envCookiesPath, envCookiesContent, { mode: 0o600 });
+}
+const secretCookiesPath = '/etc/secrets/cookies.txt';
+const localCookiesPath  = join(__dirname, 'cookies.txt');
+const COOKIES_PATH = process.env.COOKIES_PATH
+  || (envCookiesContent.trim() ? envCookiesPath : null)
+  || (existsSync(secretCookiesPath) ? secretCookiesPath : (existsSync(localCookiesPath) ? localCookiesPath : null));
+if (COOKIES_PATH) console.log(`[INIT] Cookies loaded from: ${COOKIES_PATH}`);
+
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '*')
+  .split(',').map(origin => origin.trim()).filter(Boolean);
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes('*') || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(null, false);
+  },
+}));
 app.use(express.json({ limit: '10mb' }));
 
 console.log(`[INIT] FFmpeg location: ${ffmpegPath || 'None'}`);
@@ -271,6 +294,10 @@ export function buildQualityTiers(formats = [], durationSeconds = 0) {
           fps: compatibleVideo.fps ? `${Math.round(compatibleVideo.fps)} FPS` : 'FPS: Unknown',
           codec: formatVideoCodec(compatibleVideo.vcodec),
           acodec: compatibleAudio ? formatAudioCodec(compatibleAudio.acodec) : 'None',
+          vcodecRaw: compatibleVideo.vcodec || null,
+          acodecRaw: isAac(compatibleVideo) ? compatibleVideo.acodec : (compatibleAudio?.acodec || null),
+          ext: compatibleVideo.ext || 'mp4',
+          directUrl: isAac(compatibleVideo) ? (compatibleVideo.url || null) : null,
           isDirectProgressive: Boolean(isAac(compatibleVideo)),
         }
       : null;
@@ -301,6 +328,7 @@ export function buildQualityTiers(formats = [], durationSeconds = 0) {
       codec: vcodecStr,
       vcodecRaw: bestVid.vcodec,
       acodec: acodecStr,
+      acodecRaw: isDirect ? bestVid.acodec : (selectedAudio?.acodec || null),
       audio: audioLabel,
       bitrate: bestVid.tbr || bestVid.vbr ? `${Math.round(bestVid.tbr || bestVid.vbr)} kbps` : null,
       estimatedSize: estSize,
@@ -404,18 +432,100 @@ function getSelectedIOSSource(tier) {
   };
 }
 
-async function prepareVideoDownload({ url, qualityId = '4k', outputMode = 'source', onDownloadStarted }, onProgress = () => {}) {
+function getCachedInfo(url) {
+  const key = String(url || '').trim();
+  const entry = INFO_CACHE.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > INFO_CACHE_TTL_MS) {
+    INFO_CACHE.delete(key);
+    return null;
+  }
+  return entry.infoObjects;
+}
+
+function setCachedInfo(url, infoObjects) {
+  const key = String(url || '').trim();
+  if (!key || !Array.isArray(infoObjects) || !infoObjects.length) return;
+  if (INFO_CACHE.size >= INFO_CACHE_MAX) {
+    const oldestKey = INFO_CACHE.keys().next().value;
+    if (oldestKey) INFO_CACHE.delete(oldestKey);
+  }
+  INFO_CACHE.set(key, { ts: Date.now(), infoObjects });
+}
+
+function isDirectMp4Compatible(formatObj, sourceTier, outputMode) {
+  const container = String(formatObj?.ext || sourceTier?.ext || '').toLowerCase();
+  if (container !== 'mp4') return false;
+  if (outputMode !== 'ios-compatible') return true;
+  const vcodec = formatObj?.vcodec ?? sourceTier?.vcodecRaw;
+  const acodec = formatObj?.acodec ?? sourceTier?.acodecRaw;
+  return isH264({ vcodec }) && isAac({ acodec }) && (!formatObj || isSDR(formatObj));
+}
+
+export function findDirectStreamCandidate({ primary, tier, outputMode = 'source' }) {
+  if (!primary || !tier) return null;
+  const iosSource = outputMode === 'ios-compatible' ? getSelectedIOSSource(tier) : null;
+  const sourceTier = iosSource || tier;
+  if (!sourceTier?.isDirectProgressive) return null;
+
+  const fmtObj = (primary.formats || []).find(f => f.format_id === sourceTier.videoFormatId) || null;
+  const streamUrl = sourceTier.directUrl || fmtObj?.url || null;
+  if (!isValidMediaUrl(streamUrl)) return null;
+  if (/\.m3u8(\?|$)/i.test(streamUrl) || String(fmtObj?.protocol || '').includes('m3u8')) return null;
+  if (!isDirectMp4Compatible(fmtObj, sourceTier, outputMode)) return null;
+
+  return {
+    url: streamUrl,
+    headers: fmtObj?.http_headers || primary.http_headers || {},
+    sourceTier,
+    fmtObj,
+  };
+}
+
+async function probeDirectStreamUrl(streamUrl, upstreamHeaders = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 6000);
+  try {
+    const headers = { 'User-Agent': UA, ...upstreamHeaders, Range: 'bytes=0-0' };
+    const res = await fetch(streamUrl, { headers, redirect: 'follow', signal: controller.signal });
+    const contentType = String(res.headers.get('content-type') || '').toLowerCase();
+    const contentRange = res.headers.get('content-range') || '';
+    const contentLength = Number(res.headers.get('content-length') || 0);
+    await res.body?.cancel?.().catch(() => {});
+    if (!res.ok && res.status !== 206) return { ok: false };
+    if (contentType.includes('text/html') || contentType.includes('mpegurl')) return { ok: false };
+    const totalMatch = contentRange.match(/\/(\d+)\s*$/);
+    const size = totalMatch ? Number(totalMatch[1]) : (res.status === 200 ? contentLength : 0);
+    return { ok: true, size: Number.isFinite(size) ? size : 0 };
+  } catch {
+    return { ok: false };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function prepareVideoDownload({ url, qualityId = '4k', outputMode = 'source', cachedPrimary = null, onDownloadStarted }, onProgress = () => {}) {
   if (!isValidMediaUrl(url)) throw new Error('Enter a valid http or https video URL.');
   if (!VALID_QUALITY_IDS.has(qualityId)) throw new Error('That video quality is not supported.');
   if (!['source', 'ios-compatible'].includes(outputMode)) throw new Error('That output mode is not supported.');
+  if (activeVideoPreparations >= MAX_ACTIVE_VIDEO_PREPARATIONS) {
+    throw new Error('The server is preparing another video. Please wait for it to finish, then try again.');
+  }
 
   const jobId = randomUUID();
-  const jobDir = mkdtempSync(join(TEMP_DIR, `job-${jobId}-`));
+  activeVideoPreparations += 1;
+  let jobDir = null;
   try {
-    onProgress('analyzing', 3, 'Analyzing available source formats…');
-    const [primary] = await ytDlpJsonLines([
-      '--dump-json', '--no-playlist', '--no-warnings', '--user-agent', UA, url,
-    ]);
+    jobDir = mkdtempSync(join(TEMP_DIR, `job-${jobId}-`));
+    let primary = cachedPrimary || getCachedInfo(url)?.[0] || null;
+    if (!primary) {
+      onProgress('analyzing', 3, 'Analyzing available source formats…');
+      const infoObjects = await ytDlpJsonLines([
+        '--dump-json', '--no-playlist', '--no-warnings', '--user-agent', UA, url,
+      ]);
+      setCachedInfo(url, infoObjects);
+      primary = infoObjects[0];
+    }
     const title = getCaptionTitle(primary, detectPlatform(url).id);
     const tiers = buildQualityTiers(primary.formats || [], primary.duration);
     const tier = selectVideoTier(tiers, qualityId);
@@ -448,11 +558,32 @@ async function prepareVideoDownload({ url, qualityId = '4k', outputMode = 'sourc
     if (expectsAudio && !input.hasAudio) throw new Error('The downloaded file is missing its expected audio stream.');
 
     onProgress('processing', 91, outputMode === 'ios-compatible' ? 'Preparing iPhone playback…' : 'Preparing MP4 for playback…');
-    let outputPath = await makeFastStartMp4(downloadedPath, jobDir, title);
-    let output = await probeMediaFile(outputPath);
     let transcoded = false;
+    let outputPath;
+    let output;
 
-    if (outputMode === 'ios-compatible' && !output.iosPlayable) {
+    // Probe the downloaded source first. A compatible H.264/AAC file only needs
+    // a stream-copy remux for fast-start; avoid encoding it altogether.
+    if (outputMode === 'ios-compatible' && !input.iosPlayable) {
+      if (LOW_MEMORY_HOST && Math.max(input.width || 0, input.height || 0) >= 2400) {
+        throw new Error('This 2K/4K stream is not H.264 and cannot be re-encoded on a 512 MB server. Switch Playback format to "Original source quality" or choose 1080p.');
+      }
+      onProgress('converting', 93, 'Converting to iPhone-compatible H.264/AAC…');
+      outputPath = await transcodeForIOS(downloadedPath, jobDir, title, input);
+      output = await probeMediaFile(outputPath);
+      transcoded = true;
+      if (!output.iosPlayable) throw new Error('FFmpeg finished, but the result did not pass iPhone playback checks.');
+    } else {
+      outputPath = await makeFastStartMp4(downloadedPath, jobDir, title);
+      output = await probeMediaFile(outputPath);
+    }
+
+    // Keep the final iPhone guarantee even if a remux unexpectedly changes
+    // codec/container signaling. Retry with a compatibility encode only then.
+    if (outputMode === 'ios-compatible' && !output.iosPlayable && !transcoded) {
+      if (LOW_MEMORY_HOST && Math.max(input.width || 0, input.height || 0) >= 2400) {
+        throw new Error('This 2K/4K stream is not H.264 and cannot be re-encoded on a 512 MB server. Switch Playback format to "Original source quality" or choose 1080p.');
+      }
       onProgress('converting', 93, 'Converting to iPhone-compatible H.264/AAC…');
       outputPath = await transcodeForIOS(downloadedPath, jobDir, title, input);
       output = await probeMediaFile(outputPath);
@@ -469,6 +600,9 @@ async function prepareVideoDownload({ url, qualityId = '4k', outputMode = 'sourc
     if (expectsAudio && !output.hasAudio) throw new Error('The final MP4 is missing its expected audio stream.');
     if (!String(output.format || '').toLowerCase().includes('mp4')) {
       throw new Error('The final output is not a valid MP4 container.');
+    }
+    if (outputMode === 'ios-compatible' && !output.iosPlayable) {
+      throw new Error('The final video did not pass iPhone compatibility checks.');
     }
     if (input.width !== output.width || input.height !== output.height) {
       throw new Error(`Output dimensions changed unexpectedly (${input.width}×${input.height} to ${output.width}×${output.height}).`);
@@ -514,8 +648,10 @@ async function prepareVideoDownload({ url, qualityId = '4k', outputMode = 'sourc
     onProgress('ready', 100, 'Video is ready.');
     return result;
   } catch (error) {
-    rmSync(jobDir, { recursive: true, force: true });
+    if (jobDir) rmSync(jobDir, { recursive: true, force: true });
     throw error;
+  } finally {
+    activeVideoPreparations -= 1;
   }
 }
 
@@ -526,8 +662,7 @@ function defaultOutputMode(req) {
   return /iPhone|iPad|iPod/i.test(userAgent) || ipadOS ? 'ios-compatible' : 'source';
 }
 
-function setVideoResponseHeaders(res, filePath, filename, metadata, disposition = 'attachment') {
-  const stat = statSync(filePath);
+function setVideoResponseHeaders(res, fileSize, filename, metadata, disposition = 'attachment') {
   const asciiFallback = filename.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
   res.setHeader('Content-Type', 'video/mp4');
   res.setHeader('Content-Disposition', `${disposition}; filename="${asciiFallback}"; filename*=UTF-8''${encodeFilenameHeader(filename)}`);
@@ -540,26 +675,19 @@ function setVideoResponseHeaders(res, filePath, filename, metadata, disposition 
   res.setHeader('X-Final-Fps', metadata.fps ? `${metadata.fps} FPS` : 'Unknown');
   res.setHeader('X-Final-Vcodec', (metadata.videoCodec || 'Unknown').replace(/[^\x20-\x7E]/g, '?'));
   res.setHeader('X-Final-Acodec', (metadata.audioCodec || 'None').replace(/[^\x20-\x7E]/g, '?'));
-  res.setHeader('X-Final-Size', stat.size);
+  res.setHeader('X-Final-Size', fileSize || 0);
   res.setHeader('X-iOS-Playable', String(Boolean(metadata.iosPlayable)));
   res.setHeader('X-Transcoded', String(Boolean(metadata.transcoded)));
   res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length, Accept-Ranges, X-Filename, X-Final-Resolution, X-Final-Fps, X-Final-Vcodec, X-Final-Acodec, X-Final-Size, X-iOS-Playable, X-Transcoded');
-  return stat;
-}
-
-function startNativeAttachment(res, filename) {
-  const asciiFallback = filename.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
-  res.status(200);
-  res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Content-Disposition', `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeFilenameHeader(filename)}`);
-  res.setHeader('Cache-Control', 'no-store');
-  // Send attachment headers as soon as the source title/filename is known so
-  // the browser's native download UI starts before the server finishes fetching.
-  res.flushHeaders();
 }
 
 function streamVideoFile(req, res, filePath, filename, metadata, disposition = 'attachment') {
-  const stat = setVideoResponseHeaders(res, filePath, filename, metadata, disposition);
+  const stat = statSync(filePath);
+  setVideoResponseHeaders(res, stat.size, filename, metadata, disposition);
+  if (stat.size <= 0) {
+    res.status(422).json({ error: 'The prepared video is empty and cannot be downloaded.' });
+    return;
+  }
   const rangeHeader = req.headers.range;
   if (!rangeHeader) {
     res.setHeader('Content-Length', stat.size);
@@ -584,6 +712,55 @@ function streamVideoFile(req, res, filePath, filename, metadata, disposition = '
   res.setHeader('Content-Range', `bytes ${start}-${end}/${stat.size}`);
   res.setHeader('Content-Length', end - start + 1);
   createReadStream(filePath, { start, end }).pipe(res);
+}
+
+async function streamDirectVideo(req, res, job, disposition = 'attachment') {
+  const { url, headers: upstreamHeaders = {}, size = 0 } = job.directStream;
+  const controller = new AbortController();
+  const headers = { 'User-Agent': UA, ...upstreamHeaders };
+  if (req.headers.range) headers.Range = req.headers.range;
+
+  let nodeStream = null;
+  const cleanup = () => {
+    controller.abort();
+    if (nodeStream && !nodeStream.destroyed) nodeStream.destroy();
+  };
+  res.on('close', cleanup);
+
+  try {
+    const cdnRes = await fetch(url, { headers, redirect: 'follow', signal: controller.signal });
+    if (!cdnRes.ok && cdnRes.status !== 206) {
+      res.off('close', cleanup);
+      if (!res.headersSent) res.status(502).json({ error: 'Source stream expired. Click Get video and try again.' });
+      return;
+    }
+    const contentLength = cdnRes.headers.get('content-length');
+    const resolvedSize = Number(contentLength || size || 0);
+    const metadata = { ...(job.metadata?.output || {}), transcoded: false };
+    setVideoResponseHeaders(res, resolvedSize, job.filename, metadata, disposition);
+    if (cdnRes.status === 206) {
+      res.status(206);
+      const contentRange = cdnRes.headers.get('content-range');
+      if (contentRange) res.setHeader('Content-Range', contentRange);
+    }
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+    if (!cdnRes.body) {
+      res.off('close', cleanup);
+      res.end();
+      return;
+    }
+    nodeStream = Readable.fromWeb(cdnRes.body);
+    nodeStream.on('error', err => {
+      if (err?.name !== 'AbortError') console.error('[DIRECT STREAM ERROR]', err.message);
+      if (!res.writableEnded) res.destroy(err);
+    });
+    nodeStream.pipe(res);
+  } catch (err) {
+    res.off('close', cleanup);
+    if (err?.name !== 'AbortError' && !res.headersSent) {
+      res.status(502).json({ error: 'Could not stream video from source.' });
+    }
+  }
 }
 
 function removeDownloadJob(jobId) {
@@ -696,8 +873,10 @@ async function transcodeForIOS(filePath, jobDir, title, sourceMetadata) {
   const videoCopySafe = sourceMetadata?.videoCodec === 'h264'
     && sourceMetadata?.pixelFormat === 'yuv420p'
     && !hdr;
+  const ffmpegThreads = String(process.env.FFMPEG_THREADS || (LOW_MEMORY_HOST ? '1' : '0'));
   const args = [
-    '-y', '-threads', '1', '-i', filePath, '-map', '0:v:0', '-map', '0:a:0?',
+    '-y', '-threads', ffmpegThreads,
+    '-i', filePath, '-map', '0:v:0', '-map', '0:a:0?',
   ];
   if (videoCopySafe) {
     // Already H.264/yuv420p — just remux, no encode needed (fastest path)
@@ -711,7 +890,7 @@ async function transcodeForIOS(filePath, jobDir, title, sourceMetadata) {
       );
     }
     // ultrafast preset = ~5-8x faster than medium; crf 18 = near-lossless quality (same as original)
-    args.push('-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18', '-pix_fmt', 'yuv420p', '-threads', '1');
+    args.push('-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18', '-pix_fmt', 'yuv420p', '-threads', ffmpegThreads);
   }
   // Check if audio already AAC — if so, copy it too (no re-encode at all in best case)
   const audioAlreadyAac = sourceMetadata?.audioCodec === 'aac';
@@ -935,6 +1114,7 @@ app.post('/api/info', async (req, res) => {
     }
 
     const primary = infoObjects[0] || {};
+    setCachedInfo(url, infoObjects);
     const isCarousel = infoObjects.length > 1;
 
     // Real quality tiers built from actual formats
@@ -1017,19 +1197,112 @@ app.post('/api/info', async (req, res) => {
 });
 
 // ─── Verified download jobs ───────────────────────────────────────────────────
-app.post('/api/download/jobs', (req, res) => {
+app.post('/api/download/jobs', async (req, res) => {
   const { url, qualityId = '4k', outputMode } = req.body || {};
   if (!isValidMediaUrl(url)) return res.status(400).json({ error: 'Enter a valid http or https video URL.' });
   if (!VALID_QUALITY_IDS.has(qualityId)) return res.status(400).json({ error: 'That video quality is not supported.' });
 
+  const resolvedMode = ['source', 'ios-compatible'].includes(outputMode) ? outputMode : defaultOutputMode(req);
   const id = randomUUID();
+  let cachedPrimary = getCachedInfo(url)?.[0] || null;
+
+  // Fast path: if /api/info already gave us a direct progressive MP4 stream
+  // (e.g. Instagram Reels/Posts, Facebook, TikTok), probe 1 byte and stream
+  // straight to the browser without temp files or FFmpeg.
+  if (!cachedPrimary) {
+    try {
+      const infoObjects = await ytDlpJsonLines([
+        '--dump-json', '--no-playlist', '--no-warnings', '--user-agent', UA, url,
+      ]);
+      setCachedInfo(url, infoObjects);
+      cachedPrimary = infoObjects[0] || null;
+    } catch (_) {
+      // Let prepareVideoDownload handle and surface the error via job status.
+    }
+  }
+
+  if (cachedPrimary) {
+    const tiers = buildQualityTiers(cachedPrimary.formats || [], cachedPrimary.duration);
+    const tier = selectVideoTier(tiers, qualityId);
+    const candidate = findDirectStreamCandidate({ primary: cachedPrimary, tier, outputMode: resolvedMode });
+    if (candidate) {
+      const probe = await probeDirectStreamUrl(candidate.url, candidate.headers);
+      if (probe.ok) {
+        const sourceUrl = cachedPrimary.webpage_url || url;
+        const filename = makeVideoFilename(cachedPrimary, sourceUrl);
+        const title = getCaptionTitle(cachedPrimary, detectPlatform(url).id);
+        const st = candidate.sourceTier;
+        const job = {
+          id,
+          status: 'ready',
+          stage: 'ready',
+          progress: 100,
+          message: 'Direct stream ready.',
+          outputMode: resolvedMode,
+          createdAt: Date.now(),
+          filePath: null,
+          jobDir: null,
+          filename,
+          title,
+          qualityId: tier.id,
+          transcoded: false,
+          directStream: {
+            url: candidate.url,
+            headers: candidate.headers,
+            size: probe.size,
+          },
+          metadata: {
+            source: {
+              width: st.width,
+              height: st.height,
+              fps: candidate.fmtObj?.fps || tier.fpsRaw || null,
+              videoCodec: st.vcodecRaw || tier.vcodecRaw || null,
+              videoCodecLabel: st.codec || tier.codec || null,
+              audioCodec: st.acodecRaw || tier.acodecRaw || null,
+              audioCodecLabel: st.acodec || tier.acodec || null,
+              format: 'mp4',
+              dynamicRange: cachedPrimary.dynamic_range || 'unknown',
+              iosCompatibleSourceAvailable: Boolean(tier.iosCompatibleSource),
+            },
+            output: {
+              width: st.width,
+              height: st.height,
+              fps: candidate.fmtObj?.fps || tier.fpsRaw || null,
+              videoCodec: st.vcodecRaw || tier.vcodecRaw || 'h264',
+              audioCodec: st.acodecRaw || tier.acodecRaw || 'aac',
+              format: 'mp4',
+              duration: Number(cachedPrimary.duration || 0),
+              size: probe.size,
+              iosPlayable: isDirectMp4Compatible(candidate.fmtObj, st, 'ios-compatible'),
+            },
+          },
+        };
+        DOWNLOAD_JOBS.set(id, job);
+        expireDownloadJob(job);
+        console.log(`[DIRECT STREAM READY] ${filename} (${st.width}x${st.height}, ${fmtBytes(probe.size) || 'stream'})`);
+        return res.status(200).json({
+          jobId: id,
+          status: 'ready',
+          stage: 'ready',
+          progress: 100,
+          message: 'Direct stream ready.',
+          filename,
+          metadata: job.metadata,
+          transcoded: false,
+          directStream: true,
+          outputMode: resolvedMode,
+        });
+      }
+    }
+  }
+
   const job = {
     id,
     status: 'analyzing',
     stage: 'analyzing',
     progress: 2,
     message: 'Starting download preparation…',
-    outputMode: ['source', 'ios-compatible'].includes(outputMode) ? outputMode : defaultOutputMode(req),
+    outputMode: resolvedMode,
     createdAt: Date.now(),
     filePath: null,
     jobDir: null,
@@ -1037,7 +1310,7 @@ app.post('/api/download/jobs', (req, res) => {
   DOWNLOAD_JOBS.set(id, job);
   res.status(202).json({ jobId: id, status: job.status });
 
-  prepareVideoDownload({ url, qualityId, outputMode: job.outputMode }, (stage, progress, message) => {
+  prepareVideoDownload({ url, qualityId, outputMode: job.outputMode, cachedPrimary }, (stage, progress, message) => {
     if (stage !== 'ready') job.status = stage;
     job.stage = stage;
     job.progress = progress;
@@ -1069,6 +1342,7 @@ app.get('/api/download/jobs/:jobId', (req, res) => {
     filename: job.filename || null,
     metadata: job.metadata || null,
     transcoded: Boolean(job.transcoded),
+    directStream: Boolean(job.directStream),
     outputMode: job.outputMode,
   });
 });
@@ -1077,10 +1351,16 @@ app.get('/api/download/jobs/:jobId/file', (req, res) => {
   const id = req.params.jobId;
   if (!/^[0-9a-f-]{36}$/i.test(id)) return res.status(400).json({ error: 'Invalid download job ID.' });
   const job = DOWNLOAD_JOBS.get(id);
-  if (!job || job.status !== 'ready' || !job.filePath || !existsSync(job.filePath)) {
+  if (!job || job.status !== 'ready') {
     return res.status(409).json({ error: 'This video is not ready yet. Wait for verification to finish.' });
   }
   const disposition = req.query.inline === '1' ? 'inline' : 'attachment';
+  if (job.directStream) {
+    return streamDirectVideo(req, res, job, disposition);
+  }
+  if (!job.filePath || !existsSync(job.filePath) || statSync(job.filePath).size <= 0) {
+    return res.status(409).json({ error: 'This video is not ready yet. Wait for verification to finish.' });
+  }
   const metadata = { ...job.metadata.output, transcoded: job.transcoded };
   streamVideoFile(req, res, job.filePath, job.filename, metadata, disposition);
 });
@@ -1092,7 +1372,13 @@ app.get('/api/download/jobs/:jobId/download', (req, res) => {
   if (!/^[0-9a-f-]{36}$/i.test(id)) return res.status(400).json({ error: 'Invalid download job ID.' });
   const job = DOWNLOAD_JOBS.get(id);
   if (!job) return res.status(404).json({ error: 'Download job expired or not found.' });
-  if (job.status !== 'ready' || !job.filePath || !existsSync(job.filePath)) {
+  if (job.status !== 'ready') {
+    return res.status(409).json({ error: 'This video is not ready yet.' });
+  }
+  if (job.directStream) {
+    return streamDirectVideo(req, res, job, 'attachment');
+  }
+  if (!job.filePath || !existsSync(job.filePath) || statSync(job.filePath).size <= 0) {
     return res.status(409).json({ error: 'This video is not ready yet.' });
   }
   // Stream directly with attachment disposition — mobile browsers show native download UI
@@ -1102,92 +1388,37 @@ app.get('/api/download/jobs/:jobId/download', (req, res) => {
 
 // ─── POST /api/download (existing desktop-compatible endpoint) ───────────────
 app.post('/api/download', async (req, res) => {
-  const { url, qualityId = '4k', audioOnly = false, outputMode } = req.body || {};
+  const { url, qualityId = '4k', audioOnly = false } = req.body || {};
   const isAudio = Boolean(audioOnly) || qualityId === 'audio-320' || qualityId === 'audio';
   if (!isValidMediaUrl(url)) return res.status(400).json({ error: 'Enter a valid http or https video URL.' });
+  if (!isAudio) {
+    return res.status(410).json({ error: 'Video downloads use the verified /api/download/jobs flow.' });
+  }
   let jobDir = null;
   try {
-    if (isAudio) {
-      const [primary] = await ytDlpJsonLines(['--dump-json', '--no-playlist', '--no-warnings', '--user-agent', UA, url]);
-      jobDir = mkdtempSync(join(TEMP_DIR, 'audio-'));
-      const args = [url, '-o', join(jobDir, 'audio.%(ext)s'), '--no-playlist', '--no-warnings', '--user-agent', UA, '-f', 'bestaudio/best', '--extract-audio', '--audio-format', 'mp3', '--audio-quality', '0'];
-      const filePath = await ytDlpDownload(args, 'audio', true, jobDir);
-      const probe = await probeMediaFile(filePath);
-      if (!probe.hasAudio || probe.size <= 0) throw new Error('The output does not contain a valid audio stream.');
-      const stat = statSync(filePath);
-      const filename = `${sanitizeFilename(getCaptionTitle(primary, detectPlatform(url).id), 'audio')}.mp3`;
-      const asciiFallback = filename.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
-      res.setHeader('Content-Type', 'audio/mpeg');
-      res.setHeader('Content-Disposition', `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeFilenameHeader(filename)}`);
-      res.setHeader('Content-Length', stat.size);
-      return createReadStream(filePath).pipe(res).on('close', () => rmSync(jobDir, { recursive: true, force: true }));
+    let primary = getCachedInfo(url)?.[0] || null;
+    if (!primary) {
+      const infoObjects = await ytDlpJsonLines(['--dump-json', '--no-playlist', '--no-warnings', '--user-agent', UA, url]);
+      setCachedInfo(url, infoObjects);
+      primary = infoObjects[0];
     }
-
-    // Fast path: If the media format has a direct stream URL (e.g. Instagram progressive MP4),
-    // stream it directly chunk-by-chunk to the user with zero disk usage and zero FFmpeg overhead!
-    try {
-      const [primary] = await ytDlpJsonLines(['--dump-json', '--no-playlist', '--no-warnings', '--user-agent', UA, url]);
-      const direct = primary.url || (primary.formats || []).slice().reverse().find(f => f.url && f.vcodec !== 'none' && f.acodec !== 'none')?.url;
-      if (direct && !isAudio) {
-        console.log(`[DIRECT STREAM] Proxying CDN stream for ${primary.title || 'media'}`);
-        const cdnRes = await fetch(direct, { headers: { 'User-Agent': UA } });
-        if (cdnRes.ok) {
-          const filename = makeVideoFilename(primary, url);
-          const asciiFallback = filename.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
-          res.setHeader('Content-Type', 'video/mp4');
-          res.setHeader('Content-Disposition', `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeFilenameHeader(filename)}`);
-          const len = cdnRes.headers.get('content-length');
-          if (len) res.setHeader('Content-Length', len);
-          res.setHeader('X-Filename', encodeFilenameHeader(filename));
-          res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length, X-Filename');
-          return Readable.fromWeb(cdnRes.body).pipe(res);
-        }
-      }
-    } catch (directErr) {
-      console.warn('[DIRECT STREAM FALLBACK]', directErr.message);
-    }
-
-    const mode = ['source', 'ios-compatible'].includes(outputMode) ? outputMode : defaultOutputMode(req);
-    const result = await prepareVideoDownload({ url, qualityId, outputMode: mode });
-    jobDir = result.jobDir;
-    streamVideoFile(req, res, result.filePath, result.filename, { ...result.metadata.output, transcoded: result.transcoded }, 'attachment');
-    res.on('close', () => rmSync(jobDir, { recursive: true, force: true }));
+    jobDir = mkdtempSync(join(TEMP_DIR, 'audio-'));
+    const args = [url, '-o', join(jobDir, 'audio.%(ext)s'), '--no-playlist', '--no-warnings', '--user-agent', UA, '-f', 'bestaudio/best', '--extract-audio', '--audio-format', 'mp3', '--audio-quality', '0'];
+    const filePath = await ytDlpDownload(args, 'audio', true, jobDir);
+    const probe = await probeMediaFile(filePath);
+    if (!probe.hasAudio || probe.size <= 0) throw new Error('The output does not contain a valid audio stream.');
+    const stat = statSync(filePath);
+    const filename = `${sanitizeFilename(getCaptionTitle(primary, detectPlatform(url).id), 'audio')}.mp3`;
+    const asciiFallback = filename.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Disposition', `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeFilenameHeader(filename)}`);
+    res.setHeader('Content-Length', stat.size);
+    return createReadStream(filePath).pipe(res).on('close', () => rmSync(jobDir, { recursive: true, force: true }));
   } catch (error) {
     if (jobDir && existsSync(jobDir)) rmSync(jobDir, { recursive: true, force: true });
     console.error('[DOWNLOAD ERROR]', error.message);
     if (!res.headersSent) res.status(500).json({ error: parseError(error.message) });
     else res.destroy(error);
-  }
-});
-
-// ─── GET /api/stream (Native direct browser download) ──────────────────────────
-app.get('/api/stream', async (req, res) => {
-  const { url, qualityId = '4k', outputMode } = req.query;
-  if (!isValidMediaUrl(url)) return res.status(400).send('Enter a valid http or https video URL.');
-  if (!VALID_QUALITY_IDS.has(qualityId)) return res.status(400).send('That video quality is not supported.');
-  let jobDir = null;
-  let attachmentStarted = false;
-  try {
-    const result = await prepareVideoDownload({
-      url,
-      qualityId,
-      outputMode: ['source', 'ios-compatible'].includes(outputMode) ? outputMode : defaultOutputMode(req),
-      onDownloadStarted: filename => {
-        if (!attachmentStarted && !res.destroyed) {
-          startNativeAttachment(res, filename);
-          attachmentStarted = true;
-        }
-      },
-    });
-    jobDir = result.jobDir;
-    if (!attachmentStarted) startNativeAttachment(res, result.filename);
-    createReadStream(result.filePath).pipe(res);
-    res.on('close', () => rmSync(jobDir, { recursive: true, force: true }));
-  } catch (err) {
-    console.error('[NATIVE STREAM ERR]', err.message);
-    if (jobDir && existsSync(jobDir)) rmSync(jobDir, { recursive: true, force: true });
-    if (!res.headersSent) res.status(500).send(parseError(err.message));
-    else res.destroy(err);
   }
 });
 
@@ -1216,9 +1447,13 @@ app.post('/api/carousel-download', async (req, res) => {
     if (isAudio) {
       formatArg = 'bestaudio/best';
     } else {
-      const entries = await ytDlpJsonLines([
-        '--dump-json', '--yes-playlist', '--no-warnings', '--user-agent', UA, url,
-      ]);
+      let entries = getCachedInfo(url);
+      if (!entries) {
+        entries = await ytDlpJsonLines([
+          '--dump-json', '--yes-playlist', '--no-warnings', '--user-agent', UA, url,
+        ]);
+        setCachedInfo(url, entries);
+      }
       const entry = entries[slideNum - 1];
       if (!entry) return res.status(404).json({ error: `Carousel slide ${slideNum} was not found.` });
       const tiers = buildQualityTiers(entry.formats || [], entry.duration);
@@ -1305,6 +1540,18 @@ app.get('/api/health', (_req, res) => {
     });
   });
 });
+
+// ─── Serve built frontend in production (Docker / HF Spaces) ───────────────────
+const distDir = join(__dirname, 'dist');
+if (existsSync(distDir)) {
+  app.use(express.static(distDir));
+  app.use((req, res, next) => {
+    if ((req.method === 'GET' || req.method === 'HEAD') && !req.path.startsWith('/api')) {
+      return res.sendFile(join(distDir, 'index.html'));
+    }
+    return next();
+  });
+}
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {

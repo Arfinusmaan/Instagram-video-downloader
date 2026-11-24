@@ -634,6 +634,16 @@ img { max-width: 100%; display: block; }
 
 /* Download actions */
 .dl-actions { display:flex; flex-direction:column; gap:.6rem; }
+.output-mode-control {
+  display:flex; align-items:center; justify-content:space-between; gap:.75rem;
+  color:var(--text-muted); font-size:.84rem; font-weight:600;
+}
+.output-mode-control select {
+  max-width:70%; padding:.55rem .7rem; border-radius:var(--r-sm);
+  background:rgba(255,255,255,.05); border:1px solid var(--border);
+  color:var(--text); font:inherit;
+}
+.output-mode-control select:disabled { opacity:.6; }
 .dl-primary {
   display:flex; align-items:center; justify-content:center; gap:.7rem;
   padding:1rem 1.4rem;

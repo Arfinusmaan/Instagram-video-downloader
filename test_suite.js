@@ -1,6 +1,6 @@
 import {
   getResolutionTier, formatVideoCodec, formatAudioCodec, buildQualityTiers,
-  makeVideoFilename, isIOSPlayable,
+  makeVideoFilename, isIOSPlayable, findDirectStreamCandidate,
 } from './server.js';
 
 let passed = 0;
@@ -122,6 +122,46 @@ const compatibleProbe = { format: { format_name: 'mov,mp4,m4a,3gp,3g2,mj2' }, st
 ] };
 assert('TEST T: H.264/AAC/YUV420P SDR MP4 is iPhone playable', isIOSPlayable(compatibleProbe));
 assert('TEST U: VP9 is not iPhone playable under the conservative check', !isIOSPlayable({ ...compatibleProbe, streams: [{ ...compatibleProbe.streams[0], codec_name: 'vp9' }, compatibleProbe.streams[1]] }));
+
+// TEST V: Direct streaming eligibility for progressive MP4 vs DASH vs iOS
+const progressivePrimary = {
+  formats: [
+    { format_id: 'ig_hd', width: 1080, height: 1920, vcodec: 'avc1.640028', acodec: 'mp4a.40.2', ext: 'mp4', fps: 30, url: 'https://cdn.example.com/reel.mp4' },
+  ],
+};
+const progressiveTier = buildQualityTiers(progressivePrimary.formats, 15).find(t => t.id === '1080p');
+assert(
+  'TEST V: Progressive H.264/AAC MP4 is direct-stream eligible for source and iOS',
+  findDirectStreamCandidate({ primary: progressivePrimary, tier: progressiveTier, outputMode: 'source' })?.url === 'https://cdn.example.com/reel.mp4'
+    && findDirectStreamCandidate({ primary: progressivePrimary, tier: progressiveTier, outputMode: 'ios-compatible' })?.url === 'https://cdn.example.com/reel.mp4',
+  progressiveTier,
+);
+
+const dashPrimary = {
+  formats: [
+    { format_id: 'yt_4k', width: 3840, height: 2160, vcodec: 'vp09.00.51.08', acodec: 'none', ext: 'webm', fps: 60, url: 'https://cdn.example.com/video.webm' },
+    { format_id: 'yt_a', acodec: 'mp4a.40.2', ext: 'm4a', abr: 128, url: 'https://cdn.example.com/audio.m4a' },
+  ],
+};
+const dashTier = buildQualityTiers(dashPrimary.formats, 60).find(t => t.id === '4k');
+assert(
+  'TEST W: Separate 4K DASH streams are NOT direct-streamed (require FFmpeg merge)',
+  findDirectStreamCandidate({ primary: dashPrimary, tier: dashTier, outputMode: 'source' }) === null
+    && findDirectStreamCandidate({ primary: dashPrimary, tier: dashTier, outputMode: 'ios-compatible' }) === null,
+  dashTier,
+);
+
+const hlsPrimary = {
+  formats: [
+    { format_id: 'hls_1080', width: 1080, height: 1920, vcodec: 'avc1.640028', acodec: 'mp4a.40.2', ext: 'mp4', protocol: 'm3u8_native', url: 'https://cdn.example.com/master.m3u8' },
+  ],
+};
+const hlsTier = buildQualityTiers(hlsPrimary.formats, 15).find(t => t.id === '1080p');
+assert(
+  'TEST X: HLS m3u8 playlists are NOT direct-streamed',
+  findDirectStreamCandidate({ primary: hlsPrimary, tier: hlsTier, outputMode: 'source' }) === null,
+  hlsTier,
+);
 
 console.log(`\nRESULTS: ${passed} / ${total} TESTS PASSED.`);
 process.exit(passed === total ? 0 : 1);

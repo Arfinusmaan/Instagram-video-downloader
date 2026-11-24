@@ -28,4 +28,14 @@ Open `http://<PC-LAN-IP>:5173/` on the phone, replacing `<PC-LAN-IP>` with the c
 
 ## Deployment status
 
-This app is suitable for local use and same-network phone testing. It is not ready to expose as a public service: the API accepts arbitrary URLs, allows cross-origin requests from any site, and has no authentication, rate or concurrency limits, or download timeouts. Add those protections and configure HTTPS and an explicit allowed web origin before public deployment. Install yt-dlp and FFmpeg on the deployment host; the local Windows executable is not portable to Linux hosting.
+### Google Cloud Run backend (Firebase/Vercel frontend)
+
+Firebase Hosting or Vercel can host the static frontend. The downloader backend needs a normal Node container because it runs yt-dlp and FFmpeg. Firebase Cloud Functions can allocate more memory, but it needs the Firebase Blaze plan (a Google Cloud Billing account); this project’s in-memory job registry and temporary files are a better match for one Cloud Run instance.
+
+The Cloud Run deployment files in this repository use a 4 GiB RAM instance, a 5 GiB temporary disk, one instance, one request at a time, and continuous CPU allocation while active. The disk volume currently uses Cloud Run's Preview ephemeral-disk feature. Cloud Run's free compute quota is usage-limited; billing must be enabled, and video egress/storage can still be charged. Set billing budgets before deployment.
+
+1. Install and authenticate the Google Cloud CLI, create a Google Cloud project, and enable billing.
+2. From PowerShell, run `./deploy-cloud-run.ps1 -ProjectId YOUR_PROJECT_ID -FrontendOrigin https://YOUR_SITE.vercel.app`.
+3. Copy the printed Cloud Run URL into the frontend host as `VITE_API_BASE_URL`, then rebuild/redeploy the frontend.
+
+The API currently accepts unauthenticated requests. The configured allowed origin is a browser CORS rule, not authentication, and does not stop scripts or direct HTTP clients from using the service. Do not treat this as a public production deployment until API authentication and request-rate limits are added. Keep the Cloud Run maximum instance count at one while download-job state remains in memory.

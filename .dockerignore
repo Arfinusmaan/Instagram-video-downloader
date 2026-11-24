@@ -1,0 +1,11 @@
+.git
+.gitignore
+.gcloudignore
+.dockerignore
+node_modules
+dist
+.tools
+cookies*.txt
+secrets
+*.zip
+*.log
